@@ -1,0 +1,40 @@
+{
+  "name": "mohammad-travels",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Muhammad Tours and Travels \u2014 B2B/B2C/Corporate travel platform monorepo",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run start:dev --workspace=apps/api",
+    "dev:admin": "npm run dev --workspace=apps/admin",
+    "dev:web": "npm run dev --workspace=apps/web",
+    "dev:b2b": "npm run dev --workspace=apps/b2b",
+    "dev:corporate": "npm run dev --workspace=apps/corporate",
+    "dev:mobile": "npm run start --workspace=apps/mobile",
+    "build": "npm run build --workspace=@mohammad-travels/types && npm run build --workspace=apps/api && npm run build --workspace=apps/web && npm run build --workspace=apps/b2b && npm run build --workspace=apps/corporate && npm run build --workspace=apps/admin",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run build:types && npm run typecheck --workspace=apps/api && npm run typecheck --workspace=apps/web && npm run typecheck --workspace=apps/b2b && npm run typecheck --workspace=apps/corporate && npm run typecheck --workspace=apps/admin && npm run typecheck --workspace=apps/mobile",
+    "db:migrate": "npm run prisma:migrate --workspace=apps/api",
+    "db:seed": "npm run build --workspace=@mohammad-travels/types && ts-node database/seeds/seed.ts && npm run db:seed:reference-data && npm run db:seed:suppliers",
+    "db:seed:reference-data": "ts-node database/seeds/reference-data.seed.ts",
+    "db:seed:suppliers": "ts-node database/seeds/suppliers.seed.ts",
+    "db:seed:demo": "ts-node database/seeds/demo-accounts.seed.ts",
+    "deploy:check": "node scripts/deploy-check.mjs",
+    "deploy:prod": "docker compose --env-file .env.production -f docker-compose.production.yml up -d --build",
+    "deploy:migrate": "docker compose --env-file .env.production -f docker-compose.production.yml run --rm api npx prisma migrate deploy",
+    "deploy:seed": "docker compose --env-file .env.production -f docker-compose.production.yml run --rm api npx ts-node database/seeds/seed.ts && docker compose --env-file .env.production -f docker-compose.production.yml run --rm api npx ts-node database/seeds/reference-data.seed.ts && docker compose --env-file .env.production -f docker-compose.production.yml run --rm api npx ts-node database/seeds/suppliers.seed.ts",
+    "deploy:seed:demo": "docker compose --env-file .env.production -f docker-compose.production.yml run --rm api npx ts-node database/seeds/demo-accounts.seed.ts",
+    "build:types": "npm run build --workspace=@mohammad-travels/types"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "ts-node": "^10.9.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

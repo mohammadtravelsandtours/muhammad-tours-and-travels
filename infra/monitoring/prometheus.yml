@@ -1,0 +1,39 @@
+# Prometheus scrape configuration for the API's GET /metrics endpoint
+# (apps/api/src/modules/metrics) — see docs/OPERATIONS.md's "Monitoring
+# & alerting" section for how this fits into the overall pipeline.
+#
+# Run locally alongside the app stack with:
+#   docker compose -f docker-compose.yml -f infra/monitoring/docker-compose.monitoring.yml up
+#
+# This scrapes the `api` service's container port directly (Docker
+# Compose's internal DNS resolves the service name), NOT through
+# whatever public ingress fronts it in staging/production — see this
+# file's own note below on why /metrics must never be reachable from
+# the public internet.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+scrape_configs:
+  - job_name: 'mohammad-travels-api'
+    metrics_path: /api/v1/metrics
+    static_configs:
+      - targets: ['api:4000']
+        labels:
+          service: api
+          env: '${ENVIRONMENT:-local}'
+
+  # Prometheus can scrape its own metrics too — useful for a "is
+  # monitoring itself healthy" dashboard panel with near-zero setup cost.
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

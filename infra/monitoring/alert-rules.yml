@@ -1,0 +1,93 @@
+# Alerting rules evaluated by Prometheus (see prometheus.yml's
+# `rule_files`) and routed through Alertmanager. Thresholds here are
+# starting points, not tuned against real production traffic — this
+# platform has never served real traffic (see docs/OPERATIONS.md) — so
+# treat every `for:`/threshold pair as a first guess to revisit once
+# real request-volume data exists, not a validated SLO.
+groups:
+  - name: mohammad-travels-availability
+    rules:
+      - alert: APIDown
+        expr: up{job="mohammad-travels-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'API target is not reachable by Prometheus'
+          description: 'Prometheus has failed to scrape the API for 1 minute. Check container/process health and network path before assuming an app-level bug.'
+
+      - alert: HealthCheckDegraded
+        # Complements APIDown: the process can be up and scrapeable while
+        # GET /health itself reports "degraded" (DB or Redis down) — a
+        # separate, more specific failure mode. Requires a Prometheus
+        # blackbox_exporter (or equivalent) probing /api/v1/health
+        # separately; not wired up in this repo yet — see
+        # docs/OPERATIONS.md's "not yet done" note.
+        expr: probe_success{job="blackbox-health"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'GET /health is reporting degraded or unreachable'
+          description: 'The API process is up but its own dependency check (Postgres/Redis) is failing. See the correlated request-id in structured logs for the specific failing dependency.'
+
+  - name: mohammad-travels-http
+    rules:
+      - alert: HighHTTP5xxRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total[5m]))
+          > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'More than 5% of requests are failing with a 5xx'
+          description: 'Sustained 5xx rate above 5% over 5 minutes. Check the LoggingInterceptor structured logs filtered by requestId for the failing routes.'
+
+      - alert: SlowRequests
+        expr: |
+          histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, route))
+          > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'p95 request latency above 2s for a route'
+          description: 'A route''s 95th-percentile latency has exceeded 2 seconds for 10 minutes — check whether a specific supplier or the database is the bottleneck.'
+
+  - name: mohammad-travels-suppliers
+    rules:
+      - alert: SupplierUnhealthy
+        expr: supplier_health_up{active="true"} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'An active flight supplier has been unhealthy for 10+ minutes'
+          description: 'supplier_health_up is 0 for an active supplier. The search orchestrator tolerates this (per-supplier isolation), but sustained downtime shrinks fare coverage — check SupplierHealth.lastErrorMessage in the admin suppliers dashboard.'
+
+      - alert: SupplierConsecutiveErrorsHigh
+        expr: supplier_health_consecutive_errors > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'A supplier has 10+ consecutive failed calls'
+          description: 'Consider flipping this supplier''s `active` flag off (Suppliers admin screen) until the root cause is fixed, rather than letting every search keep paying its timeout cost.'
+
+  - name: mohammad-travels-payments
+    rules:
+      - alert: HighPaymentFailureRate
+        expr: |
+          sum(rate(payments_processed_total{status="FAILED"}[15m]))
+          /
+          sum(rate(payments_processed_total[15m]))
+          > 0.1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'More than 10% of payment attempts are failing'
+          description: 'Check whether this correlates with a specific provider (label `provider`) — a real gateway (Stripe) failing differs in urgency from the MANUAL mock provider failing, which should never happen.'

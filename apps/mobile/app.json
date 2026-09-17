@@ -1,0 +1,28 @@
+{
+  "expo": {
+    "name": "Muhammad Tours and Travels",
+    "slug": "mohammad-travels",
+    "scheme": "mohammadtravels",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "assetBundlePatterns": ["**/*"],
+    "icon": "./assets/icon.png",
+    "splash": {
+      "backgroundColor": "#FBF7F0"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.mohammadtravels.app"
+    },
+    "android": {
+      "package": "com.mohammadtravels.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#FBF7F0"
+      }
+    },
+    "extra": {
+      "apiUrl": "http://localhost:4000/api/v1"
+    }
+  }
+}

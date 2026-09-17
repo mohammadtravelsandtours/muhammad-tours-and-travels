@@ -1,0 +1,33 @@
+# Production API image. Uses the repository workspace so shared types and
+# Prisma generation stay aligned with the NestJS application.
+FROM node:20-alpine AS builder
+WORKDIR /repo
+
+COPY package.json package-lock.json* ./
+COPY apps/api/package.json apps/api/package.json
+COPY packages/types/package.json packages/types/package.json
+RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi
+
+COPY packages/types packages/types
+COPY apps/api apps/api
+COPY tsconfig.base.json ./
+
+RUN npm run build --workspace=@mohammad-travels/types
+RUN npm run --workspace=apps/api prisma:generate
+RUN npm run build --workspace=apps/api
+
+FROM node:20-alpine AS runner
+WORKDIR /repo
+ENV NODE_ENV=production
+
+COPY --from=builder /repo/node_modules ./node_modules
+COPY --from=builder /repo/packages/types/dist ./packages/types/dist
+COPY --from=builder /repo/packages/types/package.json ./packages/types/package.json
+COPY --from=builder /repo/apps/api/dist ./apps/api/dist
+COPY --from=builder /repo/apps/api/prisma ./apps/api/prisma
+COPY --from=builder /repo/apps/api/package.json ./apps/api/package.json
+COPY --from=builder /repo/database ./database
+
+EXPOSE 4000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD wget -qO- http://127.0.0.1:4000/api/v1/health >/dev/null || exit 1
+CMD ["node", "apps/api/dist/main.js"]

@@ -1,0 +1,166 @@
+name: CD
+
+# Implements docs/OPERATIONS.md's deployment pipeline diagram:
+#   CI (ci.yml) → build+push images → auto-deploy staging → manual
+#   promotion → production → (monitoring, covered by infra/monitoring)
+#
+# This workflow's build-and-push job is real and runnable as-is against
+# any container registry once REGISTRY/IMAGE_PREFIX secrets are set (it
+# defaults to GHCR, which needs no extra secret beyond the built-in
+# GITHUB_TOKEN). The two deploy jobs are NOT wired to a real target —
+# there is no actual staging/production infrastructure for this project
+# in this build (see docs/OPERATIONS.md's own "what remains" note) — so
+# each deploy step is a clearly-labeled placeholder for whatever this
+# platform's real target turns out to be (Kubernetes, ECS, a plain VM
+# over SSH, a PaaS). Replace the placeholder `run:` step with your
+# actual deploy command; everything around it (triggers, environments,
+# approval gating, image tagging) is meant to be kept as-is.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_production:
+        description: 'Also deploy to production after staging succeeds (otherwise this run only builds images + deploys staging)'
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+
+jobs:
+  # Re-runs the same gates ci.yml already enforces on every PR — belt and
+  # suspenders for the one branch (main) that actually ships. If ci.yml
+  # already ran green for this exact commit (the normal case, since this
+  # triggers on push to main after a PR merge), this is a fast no-op
+  # confirmation, not wasted work: a merge commit and its PR's head
+  # commit are not guaranteed to be identical (merge queues, squash
+  # merges), so re-verifying here is deliberate, not redundant.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  build-and-push:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: api
+            dockerfile: infra/docker/Dockerfile.api
+            build-arg-app: ''
+          - name: web
+            dockerfile: infra/docker/Dockerfile.web
+            build-arg-app: web
+          - name: b2b
+            dockerfile: infra/docker/Dockerfile.web
+            build-arg-app: b2b
+          - name: corporate
+            dockerfile: infra/docker/Dockerfile.web
+            build-arg-app: corporate
+          - name: admin
+            dockerfile: infra/docker/Dockerfile.web
+            build-arg-app: admin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.name }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          build-args: |
+            APP=${{ matrix.build-arg-app }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.name }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # A GitHub Environment gives this a place to attach staging secrets
+    # (DATABASE_URL, a staging AMADEUS_*/STRIPE_* test key, etc.) via
+    # repo Settings → Environments, without hardcoding them here — see
+    # docs/OPERATIONS.md's "Environments" section for what staging needs
+    # that this workflow does not (and should not) provision by itself.
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy images to staging
+        run: |
+          echo "PLACEHOLDER — replace with this platform's real deploy command."
+          echo "Images just pushed: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/{api,web,b2b,corporate,admin}:${{ github.sha }}"
+          echo "Typical real steps here: kubectl set image / helm upgrade / aws ecs update-service / ssh + docker compose pull && up -d"
+          echo "Then run: npm run db:migrate --workspace=apps/api (prisma migrate deploy) against the staging database BEFORE the new image serves traffic."
+          exit 0
+
+      - name: Staging smoke check
+        run: |
+          echo "PLACEHOLDER — once STAGING_URL is a real reachable host, replace with:"
+          echo "  curl -sf \"$STAGING_URL/api/v1/health\" || exit 1"
+        env:
+          STAGING_URL: ${{ vars.STAGING_URL }}
+
+  # Manual promotion, exactly as docs/OPERATIONS.md's runbook describes —
+  # never automatic. Gated on a GitHub Environment named "production"
+  # with required reviewers configured in repo Settings → Environments;
+  # until that's configured, this environment gate is a no-op and this
+  # job will run immediately, so configuring it is a real prerequisite,
+  # not decoration.
+  deploy-production:
+    needs: deploy-staging
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_production
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy images to production
+        run: |
+          echo "PLACEHOLDER — replace with this platform's real deploy command (same shape as deploy-staging's, pointed at prod)."
+          echo "Follow docs/OPERATIONS.md's promotion checklist BEFORE this step ever fires for real: backup verified, migration dry-run reviewed, rollback plan confirmed."
+          exit 0
+
+      - name: Production smoke check
+        run: |
+          echo "PLACEHOLDER — once PRODUCTION_URL is a real reachable host, replace with:"
+          echo "  curl -sf \"$PRODUCTION_URL/api/v1/health\" || exit 1"
+        env:
+          PRODUCTION_URL: ${{ vars.PRODUCTION_URL }}
+
+  # Optional, manual-only load-test smoke run against staging — never
+  # runs automatically (a load test is not something to fire on every
+  # merge to main), and never targets production. See
+  # infra/load-test/README.md for why these thresholds are first
+  # guesses, not a validated SLO.
+  load-test-smoke:
+    if: github.event_name == 'workflow_dispatch'
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run k6 smoke test against staging
+        uses: grafana/k6-action@v0.3.1
+        with:
+          filename: infra/load-test/k6-flight-search.js
+        env:
+          BASE_URL: ${{ vars.STAGING_URL }}/api/v1
+          K6_VUS: '10'
+          K6_DURATION: '1m'

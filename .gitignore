@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.next/
+.env
+.env.*
+!.env.example
+!.env.production.example
+*.log
+coverage/
+.DS_Store
+/apps/api/prisma/dev.db
+.turbo/
+*.tsbuildinfo

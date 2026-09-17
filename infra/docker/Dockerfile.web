@@ -1,0 +1,41 @@
+# Shared multi-stage production build for Next.js apps.
+# Build args are intentional: NEXT_PUBLIC_* values are compiled into the
+# browser bundle by Next.js and therefore cannot safely be changed only at
+# container runtime.
+ARG APP
+ARG NEXT_PUBLIC_API_URL
+ARG NEXT_PUBLIC_SITE_URL
+FROM node:20-alpine AS builder
+ARG APP
+ARG NEXT_PUBLIC_API_URL
+ARG NEXT_PUBLIC_SITE_URL
+WORKDIR /repo
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+ENV NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL}
+
+COPY package.json package-lock.json* ./
+COPY apps/${APP}/package.json apps/${APP}/package.json
+COPY packages/types/package.json packages/types/package.json
+RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi
+
+COPY packages/types packages/types
+COPY apps/${APP} apps/${APP}
+COPY tsconfig.base.json ./
+
+RUN npm run build --workspace=@mohammad-travels/types
+RUN npm run build --workspace=apps/${APP}
+
+FROM node:20-alpine AS runner
+ARG APP
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+WORKDIR /repo
+COPY --from=builder /repo/apps/${APP}/.next ./.next
+COPY --from=builder /repo/apps/${APP}/public ./public
+COPY --from=builder /repo/apps/${APP}/package.json ./package.json
+COPY --from=builder /repo/node_modules ./node_modules
+
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD wget -qO- http://127.0.0.1:3000 >/dev/null || exit 1
+CMD ["npm", "start"]

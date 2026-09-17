@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-ground text-dusk-900 antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid theme('colors.tangerine.DEFAULT');
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+
+@layer components {
+  .input-pro {
+    @apply w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-dusk-900 outline-none transition;
+    @apply placeholder:text-slate-400 focus:border-orange-400 focus:ring-4 focus:ring-orange-100;
+  }
+
+  .page-shell {
+    @apply mx-auto w-full max-w-7xl px-5 sm:px-8;
+  }
+}

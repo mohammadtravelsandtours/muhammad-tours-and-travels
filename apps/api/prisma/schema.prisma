@@ -1,0 +1,1417 @@
+// Mohammad Travels — Phase 1 schema (identity, access, actors, audit)
+// plus Phase 2 additions (flight search/supplier/booking/wallet domain —
+// see migration 0002_phase2_flight_engine). Phase 1 tables are extended
+// only where Phase 2 genuinely requires it (see the Agent/B2BAgency note
+// below); nothing here reshapes data Phase 1 already depends on without
+// a migration that preserves it.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Identity & access ──────────────────────────────────────────────
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  passwordHash String    @map("password_hash")
+  fullName     String    @map("full_name")
+  isActive     Boolean   @default(true) @map("is_active")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  /**
+   * PHASE 14: mandatory at registration going forward (see RegisterDto),
+   * but kept nullable in the database rather than backfilled — this
+   * platform has no real phone numbers for its earlier seed/demo
+   * accounts, and fabricating one would be worse than leaving it unset.
+   * `address` was requested as optional from the start.
+   */
+  phoneNumber String?   @map("phone_number")
+  address     String?
+
+  /** Set on every completed login (post-2FA, if enabled) — never on a failed attempt or a 2FA challenge that wasn't completed. */
+  lastLoginAt DateTime? @map("last_login_at")
+
+  /**
+   * TOTP 2FA (RFC 6238), opt-in, self-service via /auth/2fa/*. The
+   * secret and backup codes are stored in the clear — there is no
+   * encryption-at-rest layer in this platform yet, the same gap already
+   * disclosed for refresh tokens/session storage elsewhere in this repo.
+   * Backup codes are stored hashed (same sha256 helper as refresh
+   * tokens), consumed one-time.
+   */
+  twoFactorEnabled     Boolean  @default(false) @map("two_factor_enabled")
+  twoFactorSecret      String?  @map("two_factor_secret")
+  twoFactorBackupCodes String[] @default([]) @map("two_factor_backup_codes")
+
+  roles         UserRole[]
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+  passwordResetTokens PasswordResetToken[]
+
+  agent     Agent?
+  customer  Customer?
+  employee  Employee?
+
+  flightSearches FlightSearch[]
+  hotelSearches  HotelSearch[]
+  visaApplicationsSubmitted VisaApplication[]
+  manpowerApplicationsSubmitted ManpowerApplication[]
+
+  @@map("users")
+}
+
+/**
+ * One-time, short-lived tokens for the self-service "forgot password"
+ * flow — never a plaintext token at rest (tokenHash mirrors
+ * RefreshToken's sha256 pattern), single-use (usedAt), and always
+ * created even for a request against a non-existent email (the service
+ * layer just declines to send anything) so the request endpoint's
+ * response can't be used to enumerate accounts.
+ */
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @map("token_hash")
+  createdAt DateTime  @default(now()) @map("created_at")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+model Role {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  users       UserRole[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model UserRole {
+  userId     String   @map("user_id") @db.Uuid
+  roleId     String   @map("role_id") @db.Uuid
+  assignedAt DateTime @default(now()) @map("assigned_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+model RolePermission {
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model RefreshToken {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  tokenHash   String    @map("token_hash")
+  deviceLabel String?   @map("device_label")
+  issuedAt    DateTime  @default(now()) @map("issued_at")
+  expiresAt   DateTime  @map("expires_at")
+  revokedAt   DateTime? @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ── Commercial actors (Phase 1: identity linkage only) ─────────────
+
+/**
+ * PHASE 2 CHANGE: Agent used to carry `agencyName`/`status` directly
+ * (a 1:1 user↔agency assumption). That doesn't hold once an agency can
+ * have multiple users (a B2B_AGENCY_ADMIN plus sub-agents, which
+ * @mohammad-travels/types' Role enum already anticipated in Phase 1).
+ * Agent is now a *membership* — one row per user belonging to one
+ * B2BAgency — and the agency-level fields moved to B2BAgency itself.
+ * See migration 0002 for how existing rows are carried over.
+ */
+model Agent {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @unique @map("user_id") @db.Uuid
+  agencyId  String   @map("agency_id") @db.Uuid
+  title     String? // e.g. "Owner", "Senior Agent" — display only, not authorization
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agency  B2BAgency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  bookings Booking[]
+  hotelBookings HotelBooking[]
+  visaApplications VisaApplication[]
+  packages TravelPackage[]
+  hajjUmrahBookings HajjUmrahBooking[]
+  manpowerApplications ManpowerApplication[]
+
+  @@index([agencyId])
+  @@map("agents")
+}
+
+model Customer {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @unique @map("user_id") @db.Uuid
+  phone     String?
+  country   String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bookings Booking[]
+  hotelBookings HotelBooking[]
+  visaApplications VisaApplication[]
+  packages TravelPackage[]
+  hajjUmrahBookings HajjUmrahBooking[]
+  manpowerApplications ManpowerApplication[]
+
+  @@map("customers")
+}
+
+model Corporate {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  departments Department[]
+  employees   Employee[]
+  costCenters CostCenter[]
+  travelPolicy TravelPolicy?
+
+  @@map("corporates")
+}
+
+model Department {
+  id          String   @id @default(uuid()) @db.Uuid
+  corporateId String   @map("corporate_id") @db.Uuid
+  name        String
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  corporate Corporate  @relation(fields: [corporateId], references: [id], onDelete: Cascade)
+  employees Employee[]
+  travelPolicyOverride DepartmentTravelPolicy?
+
+  @@map("departments")
+}
+
+model Employee {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @unique @map("user_id") @db.Uuid
+  corporateId  String   @map("corporate_id") @db.Uuid
+  departmentId String?  @map("department_id") @db.Uuid
+  /** Default cost center this employee's bookings are charged to — a booking can still be assigned a different one at booking time (see Booking.costCenterId). */
+  costCenterId String?  @map("cost_center_id") @db.Uuid
+  title        String?
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  corporate  Corporate   @relation(fields: [corporateId], references: [id], onDelete: Cascade)
+  department Department? @relation(fields: [departmentId], references: [id])
+  costCenter CostCenter? @relation(fields: [costCenterId], references: [id], onDelete: SetNull)
+
+  bookings           Booking[]
+  hotelBookings      HotelBooking[]
+  visaApplications   VisaApplication[]
+  packages           TravelPackage[]
+  hajjUmrahBookings  HajjUmrahBooking[]
+  manpowerApplications ManpowerApplication[]
+  requestedApprovals CorporateApproval[] @relation("ApprovalRequestedBy")
+
+  @@map("employees")
+}
+
+// ── Governance ──────────────────────────────────────────────────────
+
+model AuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String?  @map("user_id") @db.Uuid
+  action      String
+  resource    String
+  resourceId  String?  @map("resource_id")
+  oldValue    Json?    @map("old_value")
+  newValue    Json?    @map("new_value")
+  ipAddress   String?  @map("ip_address")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([resource, resourceId])
+  @@index([userId])
+  @@map("audit_logs")
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// PHASE 2 — Flight search, multi-supplier aggregation, booking, wallet
+// ═════════════════════════════════════════════════════════════════════
+
+// ── Reference data ───────────────────────────────────────────────────
+
+model Airport {
+  id        String   @id @default(uuid()) @db.Uuid
+  iataCode  String   @unique @map("iata_code") @db.VarChar(3)
+  name      String
+  city      String
+  country   String
+  timezone  String
+  latitude  Decimal? @db.Decimal(9, 6)
+  longitude Decimal? @db.Decimal(9, 6)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([city])
+  @@index([country])
+  @@map("airports")
+}
+
+model Airline {
+  id        String   @id @default(uuid()) @db.Uuid
+  iataCode  String   @unique @map("iata_code") @db.VarChar(2)
+  name      String
+  logoUrl   String?  @map("logo_url")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("airlines")
+}
+
+// ── Suppliers ────────────────────────────────────────────────────────
+
+enum SupplierType {
+  B2B_API // authorized API-based B2B supplier account
+  B2B_WEB // authorized B2B web portal, no API — manual/assisted fetch only, never scraped
+  GDS
+  NDC
+  MANUAL // staff enters fares by hand (e.g. a contract fare with no digital channel)
+  MOCK
+}
+
+enum SupplierCredentialStatus {
+  NOT_CONFIGURED
+  CONFIGURED
+  INVALID
+}
+
+enum SupplierHealthStatus {
+  ONLINE
+  DEGRADED
+  OFFLINE
+  AUTH_ERROR
+  TIMEOUT
+  UNKNOWN
+}
+
+/**
+ * Non-secret supplier configuration only. Real credentials (login ID,
+ * password, API key) live in environment variables named by
+ * `credentialEnvPrefix` (e.g. prefix "SUPPLIER_A" → env vars
+ * SUPPLIER_A_LOGIN_ID / SUPPLIER_A_PASSWORD) — see
+ * docs/SUPPLIER-INTEGRATION.md. Never add a plaintext secret column
+ * here; `credentialLoginIdMasked` exists purely so the admin UI can
+ * display "agent123" / "••••••••" without ever reading the real value
+ * back out of anywhere but the environment.
+ */
+model Supplier {
+  id                      String                    @id @default(uuid()) @db.Uuid
+  code                    String                    @unique // e.g. "MOCK_SUPPLIER_A"
+  name                    String
+  type                    SupplierType
+  active                  Boolean                   @default(true)
+  priority                Int                       @default(100) // lower = preferred when ranking ties
+  baseUrl                 String?                   @map("base_url")
+  currency                String                    @default("USD")
+  timeoutMs               Int                       @default(8000) @map("timeout_ms")
+  rateLimitPerMinute      Int                       @default(60) @map("rate_limit_per_minute")
+  defaultMarkupType       MarkupType?               @map("default_markup_type")
+  defaultMarkupValue      Decimal?                  @map("default_markup_value") @db.Decimal(10, 4)
+  defaultCommissionPct    Decimal?                  @map("default_commission_pct") @db.Decimal(6, 4)
+  credentialLoginIdMasked String?                   @map("credential_login_id_masked")
+  credentialEnvPrefix     String?                   @map("credential_env_prefix")
+  credentialStatus        SupplierCredentialStatus  @default(NOT_CONFIGURED) @map("credential_status")
+  createdAt               DateTime                  @default(now()) @map("created_at")
+  updatedAt               DateTime                  @updatedAt @map("updated_at")
+
+  health       SupplierHealth?
+  flightOffers FlightOffer[]
+  searchRuns   SearchSupplierRun[]
+  markupRules  MarkupRule[]
+
+  @@map("suppliers")
+}
+
+/** One current-status row per supplier — see SearchSupplierRun for per-search history. */
+model SupplierHealth {
+  supplierId        String                @id @map("supplier_id") @db.Uuid
+  status            SupplierHealthStatus  @default(UNKNOWN)
+  lastSuccessAt     DateTime?             @map("last_success_at")
+  lastErrorAt       DateTime?             @map("last_error_at")
+  lastErrorMessage  String?               @map("last_error_message")
+  avgResponseMs     Int?                  @map("avg_response_ms")
+  consecutiveErrors Int                   @default(0) @map("consecutive_errors")
+  updatedAt         DateTime              @updatedAt @map("updated_at")
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@map("supplier_health")
+}
+
+// ── Flight search & offers ──────────────────────────────────────────
+
+enum SearchChannel {
+  B2C
+  B2B
+  CORPORATE
+}
+
+enum TripType {
+  ONE_WAY
+  ROUND_TRIP
+  MULTI_CITY
+}
+
+enum CabinClass {
+  ECONOMY
+  PREMIUM_ECONOMY
+  BUSINESS
+  FIRST
+}
+
+model FlightSearch {
+  id                String        @id @default(uuid()) @db.Uuid
+  channel           SearchChannel
+  requestedByUserId String?       @map("requested_by_user_id") @db.Uuid
+  tripType          TripType      @map("trip_type")
+  cabin             CabinClass
+  adults            Int
+  children          Int           @default(0)
+  infants           Int           @default(0)
+  nationality       String? // traveler nationality context, for the transit-visa warning only
+  currency          String        @default("USD")
+  status            String        @default("COMPLETED") // PENDING | COMPLETED | FAILED
+  createdAt         DateTime      @default(now()) @map("created_at")
+  expiresAt         DateTime      @map("expires_at") // offers are not repriced/bookable past this
+
+  requestedBy  User?                @relation(fields: [requestedByUserId], references: [id], onDelete: SetNull)
+  segments     FlightSearchSegment[]
+  offers       FlightOffer[]
+  supplierRuns SearchSupplierRun[]
+
+  @@index([requestedByUserId])
+  @@map("flight_searches")
+}
+
+model FlightSearchSegment {
+  id            String   @id @default(uuid()) @db.Uuid
+  searchId      String   @map("search_id") @db.Uuid
+  sequence      Int
+  origin        String   @db.VarChar(3)
+  destination   String   @db.VarChar(3)
+  departureDate DateTime @map("departure_date") @db.Date
+
+  search FlightSearch @relation(fields: [searchId], references: [id], onDelete: Cascade)
+
+  @@map("flight_search_segments")
+}
+
+/** Per-supplier outcome of one search — the raw material for the health dashboard and partial-failure UX. */
+model SearchSupplierRun {
+  id           String   @id @default(uuid()) @db.Uuid
+  searchId     String   @map("search_id") @db.Uuid
+  supplierId   String   @map("supplier_id") @db.Uuid
+  status       String // SUCCESS | TIMEOUT | ERROR
+  latencyMs    Int?     @map("latency_ms")
+  offerCount   Int      @default(0) @map("offer_count")
+  errorMessage String?  @map("error_message")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  search   FlightSearch @relation(fields: [searchId], references: [id], onDelete: Cascade)
+  supplier Supplier     @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+
+  @@index([supplierId, createdAt])
+  @@map("search_supplier_runs")
+}
+
+model FlightOffer {
+  id                   String     @id @default(uuid()) @db.Uuid
+  searchId             String     @map("search_id") @db.Uuid
+  supplierId           String     @map("supplier_id") @db.Uuid
+  supplierOfferId      String     @map("supplier_offer_id")
+  fingerprint          String // see FlightNormalizationService — identical itinerary/cabin/fareFamily across suppliers
+  isMock               Boolean    @default(false) @map("is_mock")
+  validatingCarrier    String     @map("validating_carrier") @db.VarChar(2)
+  cabin                CabinClass
+  fareFamily           String     @map("fare_family")
+  stops                Int
+  totalDurationMinutes Int        @map("total_duration_minutes")
+  baseFare             Decimal    @map("base_fare") @db.Decimal(12, 2)
+  taxes                Decimal    @db.Decimal(12, 2)
+  fees                 Decimal    @db.Decimal(12, 2)
+  markupAmount         Decimal    @default(0) @map("markup_amount") @db.Decimal(12, 2)
+  totalFare            Decimal    @map("total_fare") @db.Decimal(12, 2)
+  currency             String
+  refundable           Boolean
+  changeable           Boolean
+  baggageCheckedKg     Int?       @map("baggage_checked_kg")
+  baggageCarryOnKg     Int?       @map("baggage_carry_on_kg")
+  baggageNote          String?    @map("baggage_note") // set when a supplier gives no baggage data — never invented
+  seatsAvailable       Int        @map("seats_available")
+  ticketingDeadline    DateTime?  @map("ticketing_deadline")
+  fareRules            Json?      @map("fare_rules")
+  transitVisaWarning   Json?      @map("transit_visa_warning")
+  createdAt            DateTime   @default(now()) @map("created_at")
+
+  search   FlightSearch    @relation(fields: [searchId], references: [id], onDelete: Cascade)
+  supplier Supplier        @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  segments FlightSegment[]
+  bookings Booking[]
+
+  @@index([searchId])
+  @@index([fingerprint])
+  @@map("flight_offers")
+}
+
+model FlightSegment {
+  id               String   @id @default(uuid()) @db.Uuid
+  offerId          String   @map("offer_id") @db.Uuid
+  sequence         Int
+  marketingCarrier String   @map("marketing_carrier") @db.VarChar(2)
+  operatingCarrier String   @map("operating_carrier") @db.VarChar(2)
+  flightNumber     String   @map("flight_number")
+  origin           String   @db.VarChar(3)
+  destination      String   @db.VarChar(3)
+  departureAt      DateTime @map("departure_at")
+  arrivalAt        DateTime @map("arrival_at")
+  durationMinutes  Int      @map("duration_minutes")
+  aircraft         String?
+  bookingClass     String   @map("booking_class")
+
+  offer FlightOffer @relation(fields: [offerId], references: [id], onDelete: Cascade)
+
+  @@index([offerId, sequence])
+  @@map("flight_segments")
+}
+
+// ── Booking, passengers, tickets ─────────────────────────────────────
+
+enum BookingStatus {
+  SEARCHED
+  PRICE_PENDING
+  PRICE_CONFIRMED
+  BOOKING_PENDING
+  CONFIRMED
+  TICKETED
+  FAILED
+  CANCELLED
+  EXPIRED
+  REFUND_PENDING
+  REFUNDED
+}
+
+enum PassengerType {
+  ADULT
+  CHILD
+  INFANT
+}
+
+model Booking {
+  id               String        @id @default(uuid()) @db.Uuid
+  bookingReference String        @unique @map("booking_reference")
+  offerId          String        @map("offer_id") @db.Uuid
+  channel          SearchChannel
+  customerId       String?       @map("customer_id") @db.Uuid
+  agentId          String?       @map("agent_id") @db.Uuid
+  employeeId       String?       @map("employee_id") @db.Uuid
+  contactName      String        @map("contact_name")
+  contactEmail     String        @map("contact_email")
+  contactPhone     String        @map("contact_phone")
+  whatsappNumber   String?       @map("whatsapp_number")
+  status           BookingStatus @default(SEARCHED)
+  currency         String
+  totalAmount      Decimal       @map("total_amount") @db.Decimal(12, 2)
+  /** The supplier's own PNR/booking id (FlightSupplierAdapter.createBooking's result) — our bookingReference is what we show the customer; this is what we'd send back to the supplier for a reprice/cancel/refund call. */
+  supplierBookingReference String? @map("supplier_booking_reference")
+  idempotencyKey   String?       @unique @map("idempotency_key")
+  /** CORPORATE-channel only — which cost center this fare is charged against (see CorporateApprovalsService / TravelPolicyService). Null for B2C/B2B. */
+  costCenterId     String?       @map("cost_center_id") @db.Uuid
+  /** Set by TravelPolicyService at booking time when this booking falls outside the corporate's TravelPolicy (over the fare cap, or above the allowed cabin) — null when compliant or not CORPORATE-channel. Purely informational/audit; the actual block-vs-escalate decision already happened before the row was created. */
+  policyViolationNote String?     @map("policy_violation_note")
+  packageId        String?       @unique @map("package_id") @db.Uuid
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+
+  offer      FlightOffer    @relation(fields: [offerId], references: [id], onDelete: Restrict)
+  customer   Customer?      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  agent      Agent?         @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  employee   Employee?      @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  costCenter CostCenter?    @relation(fields: [costCenterId], references: [id], onDelete: SetNull)
+  package    TravelPackage? @relation(fields: [packageId], references: [id], onDelete: SetNull)
+
+  passengers         Passenger[]
+  statusHistory      BookingStatusHistory[]
+  tickets            Ticket[]
+  payments           Payment[]
+  refunds            Refund[]
+  walletTransactions WalletTransaction[]
+  corporateApproval  CorporateApproval?
+  commission         Commission?
+
+  @@index([customerId])
+  @@index([agentId])
+  @@index([employeeId])
+  @@index([costCenterId])
+  @@map("bookings")
+}
+
+model BookingStatusHistory {
+  id          String        @id @default(uuid()) @db.Uuid
+  bookingId   String        @map("booking_id") @db.Uuid
+  fromStatus  BookingStatus? @map("from_status")
+  toStatus    BookingStatus @map("to_status")
+  actorUserId String?       @map("actor_user_id") @db.Uuid
+  reason      String?
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@index([bookingId])
+  @@map("booking_status_history")
+}
+
+model Passenger {
+  id                     String        @id @default(uuid()) @db.Uuid
+  bookingId              String        @map("booking_id") @db.Uuid
+  type                   PassengerType
+  title                  String
+  firstName              String        @map("first_name")
+  middleName             String?       @map("middle_name")
+  lastName               String        @map("last_name")
+  dateOfBirth            DateTime      @map("date_of_birth") @db.Date
+  gender                 String?
+  nationality            String?
+  passportNumber         String?       @map("passport_number")
+  passportExpiry         DateTime?     @map("passport_expiry") @db.Date
+  passportIssuingCountry String?       @map("passport_issuing_country")
+
+  booking Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  tickets Ticket[]
+
+  @@index([bookingId])
+  @@map("passengers")
+}
+
+model Ticket {
+  id           String    @id @default(uuid()) @db.Uuid
+  bookingId    String    @map("booking_id") @db.Uuid
+  passengerId  String    @map("passenger_id") @db.Uuid
+  ticketNumber String    @unique @map("ticket_number")
+  status       String    @default("ISSUED") // ISSUED | VOID | REFUNDED
+  issuedAt     DateTime? @map("issued_at")
+
+  booking   Booking   @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  passenger Passenger @relation(fields: [passengerId], references: [id], onDelete: Cascade)
+
+  @@map("tickets")
+}
+
+// ── Payments & refunds ───────────────────────────────────────────────
+
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  PAID
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+/**
+ * Polymorphic across product lines: exactly one of bookingId (flight) /
+ * hotelBookingId / hajjUmrahBookingId is set (enforced in PaymentsService,
+ * not in SQL — chargeForBooking/chargeForHotelBooking/
+ * chargeForHajjUmrahBooking each set only their own column). Phase 3/5/6
+ * added hotelBookingId; every existing flight Payment predates that column
+ * and keeps bookingId as before — see migration 0005 PART 6. The Hajj/Umrah
+ * phase added hajjUmrahBookingId the same way — see migration 0007.
+ */
+model Payment {
+  id                 String        @id @default(uuid()) @db.Uuid
+  bookingId          String?       @map("booking_id") @db.Uuid
+  hotelBookingId     String?       @map("hotel_booking_id") @db.Uuid
+  hajjUmrahBookingId String?       @map("hajj_umrah_booking_id") @db.Uuid
+  provider           String // "MANUAL" in Phase 2; real gateways plug in behind PaymentProvider (see docs)
+  providerReference  String?       @map("provider_reference")
+  amount             Decimal       @db.Decimal(12, 2)
+  currency           String
+  status             PaymentStatus @default(PENDING)
+  idempotencyKey     String        @unique @map("idempotency_key")
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt @map("updated_at")
+
+  booking          Booking?          @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  hotelBooking     HotelBooking?     @relation(fields: [hotelBookingId], references: [id], onDelete: Cascade)
+  hajjUmrahBooking HajjUmrahBooking? @relation(fields: [hajjUmrahBookingId], references: [id], onDelete: Cascade)
+
+  @@map("payments")
+}
+
+/** Polymorphic the same way as Payment — see its doc comment. */
+model Refund {
+  id             String   @id @default(uuid()) @db.Uuid
+  bookingId      String?  @map("booking_id") @db.Uuid
+  hotelBookingId String?  @map("hotel_booking_id") @db.Uuid
+  ticketId       String?  @map("ticket_id") @db.Uuid
+  amount         Decimal  @db.Decimal(12, 2)
+  currency       String
+  status         String   @default("REQUESTED") // REQUESTED | APPROVED | PROCESSING | COMPLETED | REJECTED
+  reason         String?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  booking      Booking?      @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  hotelBooking HotelBooking? @relation(fields: [hotelBookingId], references: [id], onDelete: Cascade)
+  ticket       Ticket?       @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+
+  @@map("refunds")
+}
+
+// ── B2B agency, wallet & ledger ──────────────────────────────────────
+
+enum AgencyStatus {
+  PENDING_APPROVAL
+  ACTIVE
+  SUSPENDED
+}
+
+model B2BAgency {
+  id            String       @id @default(uuid()) @db.Uuid
+  name          String
+  status        AgencyStatus @default(PENDING_APPROVAL)
+  country       String?
+  currency      String       @default("USD")
+  creditLimit   Decimal      @default(0) @map("credit_limit") @db.Decimal(14, 2)
+  creditEnabled Boolean      @default(false) @map("credit_enabled")
+  approvedAt    DateTime?    @map("approved_at")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  members     Agent[]
+  wallet      Wallet?
+  markupRules MarkupRule[]
+  commissions Commission[]
+
+  @@map("b2b_agencies")
+}
+
+enum LedgerTransactionType {
+  DEPOSIT
+  BOOKING_DEBIT
+  REFUND_CREDIT
+  ADJUSTMENT_CREDIT
+  ADJUSTMENT_DEBIT
+  COMMISSION
+  SERVICE_FEE
+}
+
+/**
+ * `balance` is materialized for fast reads but is NEVER written directly
+ * by application code outside WalletService.applyTransaction — every
+ * change goes through a WalletTransaction row first (append-only ledger,
+ * docs/ARCHITECTURE.md § 24), and `balance` is re-derivable from the sum
+ * of transactions at any time as a reconciliation check.
+ */
+model Wallet {
+  id        String   @id @default(uuid()) @db.Uuid
+  agencyId  String   @unique @map("agency_id") @db.Uuid
+  currency  String
+  balance   Decimal  @default(0) @db.Decimal(14, 2)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  agency       B2BAgency           @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  transactions WalletTransaction[]
+
+  @@map("wallets")
+}
+
+model WalletTransaction {
+  id              String                @id @default(uuid()) @db.Uuid
+  walletId        String                @map("wallet_id") @db.Uuid
+  bookingId       String?               @map("booking_id") @db.Uuid
+  hotelBookingId  String?               @map("hotel_booking_id") @db.Uuid
+  type            LedgerTransactionType
+  debit           Decimal               @default(0) @db.Decimal(14, 2)
+  credit          Decimal               @default(0) @db.Decimal(14, 2)
+  previousBalance Decimal               @map("previous_balance") @db.Decimal(14, 2)
+  newBalance      Decimal               @map("new_balance") @db.Decimal(14, 2)
+  currency        String
+  reference       String?
+  description     String?
+  createdBy       String?               @map("created_by") @db.Uuid
+  /** Required for every write through WalletService.applyTransaction — a booking's own idempotencyKey for a BOOKING_DEBIT/REFUND_CREDIT, or a caller-supplied key for an admin deposit/adjustment. The unique constraint is what actually prevents a double-debit on retry, not application logic alone. */
+  idempotencyKey  String?               @unique @map("idempotency_key")
+  createdAt       DateTime              @default(now()) @map("created_at")
+
+  wallet       Wallet        @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  booking      Booking?      @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  hotelBooking HotelBooking? @relation(fields: [hotelBookingId], references: [id], onDelete: SetNull)
+
+  @@index([walletId, createdAt])
+  @@map("wallet_transactions")
+}
+
+// ── Pricing ───────────────────────────────────────────────────────────
+
+enum MarkupScope {
+  GLOBAL
+  SUPPLIER
+  AIRLINE
+  ROUTE
+  CABIN
+  FARE_FAMILY
+  AGENCY
+}
+
+enum MarkupType {
+  FIXED
+  PERCENTAGE
+}
+
+/**
+ * Evaluated most-specific-first by PricingService (scope order below);
+ * `priority` breaks ties within the same scope. Data, not code — adding
+ * a route markup is a row insert, never a deploy.
+ */
+model MarkupRule {
+  id          String      @id @default(uuid()) @db.Uuid
+  scope       MarkupScope
+  supplierId  String?     @map("supplier_id") @db.Uuid
+  airlineCode String?     @map("airline_code") @db.VarChar(2)
+  route       String? // e.g. "DAC-SIN", origin-destination of the first segment
+  cabin       CabinClass?
+  fareFamily  String?     @map("fare_family")
+  agencyId    String?     @map("agency_id") @db.Uuid
+  type        MarkupType
+  value       Decimal     @db.Decimal(10, 4)
+  minAmount   Decimal?    @map("min_amount") @db.Decimal(12, 2)
+  maxAmount   Decimal?    @map("max_amount") @db.Decimal(12, 2)
+  priority    Int         @default(100)
+  active      Boolean     @default(true)
+  createdAt   DateTime    @default(now()) @map("created_at")
+
+  supplier Supplier?  @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  agency   B2BAgency? @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@map("markup_rules")
+}
+
+model Commission {
+  id        String   @id @default(uuid()) @db.Uuid
+  agencyId  String   @map("agency_id") @db.Uuid
+  bookingId String   @unique @map("booking_id") @db.Uuid
+  amount    Decimal  @db.Decimal(12, 2)
+  rate      Decimal  @db.Decimal(6, 4)
+  status    String   @default("PENDING") // PENDING | SETTLED
+  createdAt DateTime @default(now()) @map("created_at")
+
+  agency  B2BAgency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  booking Booking   @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@map("commissions")
+}
+
+// ── Corporate approval workflow ──────────────────────────────────────
+
+enum CorporateApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/**
+ * Implemented by CorporateApprovalsService/Controller. A CORPORATE-channel
+ * booking that TravelPolicyService flags as within policy is
+ * auto-approved and ticketed immediately (no row needed here beyond a
+ * courtesy APPROVED record, decided by the system rather than a human —
+ * see BookingsService.createBooking); one that's outside policy but not
+ * hard-blocked creates a PENDING row here for a CORPORATE_APPROVER to
+ * decide on.
+ */
+model CorporateApproval {
+  id                  String                  @id @default(uuid()) @db.Uuid
+  bookingId           String                  @unique @map("booking_id") @db.Uuid
+  requestedByEmployeeId String                @map("requested_by_employee_id") @db.Uuid
+  approverUserId      String?                 @map("approver_user_id") @db.Uuid
+  status              CorporateApprovalStatus @default(PENDING)
+  reason              String?
+  decidedAt           DateTime?               @map("decided_at")
+  createdAt           DateTime                @default(now()) @map("created_at")
+
+  booking           Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  requestedByEmployee Employee @relation("ApprovalRequestedBy", fields: [requestedByEmployeeId], references: [id], onDelete: Cascade)
+
+  @@map("corporate_approvals")
+}
+
+// ── Corporate cost centers & travel policy (Phase 5) ─────────────────
+
+model CostCenter {
+  id          String   @id @default(uuid()) @db.Uuid
+  corporateId String   @map("corporate_id") @db.Uuid
+  code        String
+  name        String
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  corporate Corporate  @relation(fields: [corporateId], references: [id], onDelete: Cascade)
+  employees Employee[]
+  bookings  Booking[]
+
+  @@unique([corporateId, code])
+  @@map("cost_centers")
+}
+
+/**
+ * The corporate-wide DEFAULT policy — every corporate has at most one.
+ * A department may override it with its own DepartmentTravelPolicy row
+ * below; TravelPolicyService.resolvePolicy checks the employee's
+ * department first and falls back to this one, so a corporate with no
+ * department overrides configured behaves exactly as before department
+ * overrides existed. Evaluated by TravelPolicyService at booking time,
+ * before the booking row exists — see BookingsService.createBooking's
+ * CORPORATE branch.
+ */
+model TravelPolicy {
+  id                String     @id @default(uuid()) @db.Uuid
+  corporateId       String     @unique @map("corporate_id") @db.Uuid
+  name              String     @default("Standard policy")
+  /** Highest cabin an employee may book without it counting as a violation. */
+  maxCabin          CabinClass @default(BUSINESS) @map("max_cabin")
+  /** true = booking above maxCabin is rejected outright (never reaches the supplier); false = it's merely flagged and still requires manual approval. */
+  blockOverMaxCabin Boolean    @default(true) @map("block_over_max_cabin")
+  /** Fare above this amount requires manual CORPORATE_APPROVER sign-off even though it's otherwise in policy. Null = no soft cap. */
+  softFareCapAmount Decimal?   @map("soft_fare_cap_amount") @db.Decimal(12, 2)
+  /** Fare above this amount is rejected outright, before the booking row is created. Null = no hard cap. Must be >= softFareCapAmount when both are set (checked in TravelPolicyService, not enforceable in SQL). */
+  hardFareCapAmount Decimal?   @map("hard_fare_cap_amount") @db.Decimal(12, 2)
+  currency          String     @default("USD")
+  createdAt         DateTime   @default(now()) @map("created_at")
+  updatedAt         DateTime   @updatedAt @map("updated_at")
+
+  corporate Corporate @relation(fields: [corporateId], references: [id], onDelete: Cascade)
+
+  @@map("travel_policies")
+}
+
+/**
+ * An optional per-department override of its corporate's TravelPolicy —
+ * present only for the departments whose policy actually differs from
+ * their corporate's default (e.g. a sales department allowed BUSINESS
+ * while the rest of the company is capped at ECONOMY). A department
+ * with no row here simply uses its corporate's TravelPolicy, unchanged.
+ * Deliberately a SEPARATE model from TravelPolicy (rather than an
+ * optional departmentId column on TravelPolicy itself) so "at most one
+ * per department" is a plain, unconditional `@unique` — no partial/
+ * conditional unique index needed to also allow multiple NULL-department
+ * corporate-wide rows. Same field shape as TravelPolicy by design; kept
+ * as two models rather than one polymorphic one so a corporate-wide
+ * policy can never accidentally be created with a stray departmentId
+ * pointing at the wrong corporate's department.
+ */
+model DepartmentTravelPolicy {
+  id                String     @id @default(uuid()) @db.Uuid
+  departmentId      String     @unique @map("department_id") @db.Uuid
+  name              String     @default("Department policy")
+  maxCabin          CabinClass @default(BUSINESS) @map("max_cabin")
+  blockOverMaxCabin Boolean    @default(true) @map("block_over_max_cabin")
+  softFareCapAmount Decimal?   @map("soft_fare_cap_amount") @db.Decimal(12, 2)
+  hardFareCapAmount Decimal?   @map("hard_fare_cap_amount") @db.Decimal(12, 2)
+  currency          String     @default("USD")
+  createdAt         DateTime   @default(now()) @map("created_at")
+  updatedAt         DateTime   @updatedAt @map("updated_at")
+
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+
+  @@map("department_travel_policies")
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// PHASE 6 — Hotels, visas, packages
+// ═════════════════════════════════════════════════════════════════════
+
+model HotelProperty {
+  id         String   @id @default(uuid()) @db.Uuid
+  name       String
+  city       String
+  country    String
+  starRating Int?     @map("star_rating")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  offers HotelOffer[]
+
+  @@index([city])
+  @@map("hotel_properties")
+}
+
+/**
+ * Mirrors FlightSearch/FlightOffer's shape (search → per-supplier offers
+ * → booking, with an audit trail at each step) but deliberately keeps
+ * hotel suppliers as a plain `supplierCode` string rather than a Supplier
+ * table row — the existing Supplier model's admin fields (credential
+ * status, flight-specific markup/health wiring) don't apply to the two
+ * mock hotel adapters this phase ships with. Folding hotel suppliers
+ * into the same admin-managed Supplier table is a reasonable follow-up
+ * once a real (non-mock) hotel supplier is actually being integrated.
+ */
+model HotelSearch {
+  id                String        @id @default(uuid()) @db.Uuid
+  channel           SearchChannel
+  requestedByUserId String?       @map("requested_by_user_id") @db.Uuid
+  city              String
+  checkInDate       DateTime      @map("check_in_date") @db.Date
+  checkOutDate      DateTime      @map("check_out_date") @db.Date
+  adults            Int
+  children          Int           @default(0)
+  rooms             Int           @default(1)
+  currency          String        @default("USD")
+  expiresAt         DateTime      @map("expires_at")
+  createdAt         DateTime      @default(now()) @map("created_at")
+
+  requestedBy  User?                    @relation(fields: [requestedByUserId], references: [id], onDelete: SetNull)
+  offers       HotelOffer[]
+  supplierRuns HotelSearchSupplierRun[]
+
+  @@index([requestedByUserId])
+  @@map("hotel_searches")
+}
+
+model HotelSearchSupplierRun {
+  id           String   @id @default(uuid()) @db.Uuid
+  searchId     String   @map("search_id") @db.Uuid
+  supplierCode String   @map("supplier_code")
+  status       String // SUCCESS | PARTIAL | ERROR — aggregated across every property this supplier was asked to quote in this search (see HotelSearchOrchestratorService), not per-property
+  latencyMs    Int?     @map("latency_ms")
+  offerCount   Int      @default(0) @map("offer_count")
+  errorMessage String?  @map("error_message")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  search HotelSearch @relation(fields: [searchId], references: [id], onDelete: Cascade)
+
+  @@index([searchId])
+  @@map("hotel_search_supplier_runs")
+}
+
+enum HotelBoardType {
+  ROOM_ONLY
+  BREAKFAST
+  HALF_BOARD
+  FULL_BOARD
+}
+
+model HotelOffer {
+  id              String         @id @default(uuid()) @db.Uuid
+  searchId        String         @map("search_id") @db.Uuid
+  propertyId      String         @map("property_id") @db.Uuid
+  supplierCode    String         @map("supplier_code")
+  supplierOfferId String         @map("supplier_offer_id")
+  isMock          Boolean        @default(true) @map("is_mock")
+  roomType        String         @map("room_type")
+  board           HotelBoardType @default(ROOM_ONLY)
+  refundable      Boolean        @default(false)
+  nights          Int
+  baseFare        Decimal        @map("base_fare") @db.Decimal(12, 2)
+  taxes           Decimal        @db.Decimal(12, 2)
+  fees            Decimal        @db.Decimal(12, 2)
+  markupAmount    Decimal        @default(0) @map("markup_amount") @db.Decimal(12, 2)
+  totalFare       Decimal        @map("total_fare") @db.Decimal(12, 2)
+  currency        String
+  createdAt       DateTime       @default(now()) @map("created_at")
+
+  search   HotelSearch    @relation(fields: [searchId], references: [id], onDelete: Cascade)
+  property HotelProperty  @relation(fields: [propertyId], references: [id], onDelete: Restrict)
+  bookings HotelBooking[]
+
+  @@index([searchId])
+  @@map("hotel_offers")
+}
+
+enum HotelBookingStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+  CANCELLED
+  REFUND_PENDING
+  REFUNDED
+}
+
+model HotelBooking {
+  id                       String             @id @default(uuid()) @db.Uuid
+  bookingReference         String             @unique @map("booking_reference")
+  offerId                  String             @map("offer_id") @db.Uuid
+  channel                  SearchChannel
+  customerId               String?            @map("customer_id") @db.Uuid
+  agentId                  String?            @map("agent_id") @db.Uuid
+  employeeId               String?            @map("employee_id") @db.Uuid
+  guestName                String             @map("guest_name")
+  contactEmail             String             @map("contact_email")
+  contactPhone             String             @map("contact_phone")
+  status                   HotelBookingStatus @default(PENDING)
+  currency                 String
+  totalAmount              Decimal            @map("total_amount") @db.Decimal(12, 2)
+  supplierBookingReference String?            @map("supplier_booking_reference")
+  idempotencyKey           String?            @unique @map("idempotency_key")
+  packageId                String?            @unique @map("package_id") @db.Uuid
+  createdAt                DateTime           @default(now()) @map("created_at")
+  updatedAt                DateTime           @updatedAt @map("updated_at")
+
+  offer    HotelOffer     @relation(fields: [offerId], references: [id], onDelete: Restrict)
+  customer Customer?      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  agent    Agent?         @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  employee Employee?      @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  package  TravelPackage? @relation(fields: [packageId], references: [id], onDelete: SetNull)
+
+  payments           Payment[]
+  refunds            Refund[]
+  walletTransactions WalletTransaction[]
+
+  @@index([customerId])
+  @@index([agentId])
+  @@index([employeeId])
+  @@map("hotel_bookings")
+}
+
+enum VisaApplicationStatus {
+  SUBMITTED
+  UNDER_REVIEW
+  ADDITIONAL_INFO_REQUIRED
+  APPROVED
+  REJECTED
+}
+
+/**
+ * A workflow/document process, not a supplier-adapter search — visas
+ * aren't "searched" the way flights/hotels are, so this deliberately
+ * doesn't follow the search→offer→booking shape. staff (VISA_MANAGE)
+ * move status forward; VisaStatusHistory is this table's audit trail,
+ * mirroring BookingStatusHistory's role for Booking.
+ */
+model VisaApplication {
+  id                      String                @id @default(uuid()) @db.Uuid
+  applicationReference    String                @unique @map("application_reference")
+  destinationCountry      String                @map("destination_country")
+  visaType                String                @map("visa_type") // e.g. TOURIST, BUSINESS, UMRAH, WORK — free text, not an enum, since the real list is destination-specific and not something to hard-code
+  travelDate              DateTime?             @map("travel_date") @db.Date
+  applicantFullName       String                @map("applicant_full_name")
+  applicantPassportNumber String                @map("applicant_passport_number")
+  applicantNationality    String                @map("applicant_nationality")
+  contactEmail            String                @map("contact_email")
+  contactPhone            String                @map("contact_phone")
+  status                  VisaApplicationStatus @default(SUBMITTED)
+  reviewerNote            String?               @map("reviewer_note")
+  customerId              String?               @map("customer_id") @db.Uuid
+  agentId                 String?               @map("agent_id") @db.Uuid
+  employeeId              String?               @map("employee_id") @db.Uuid
+  submittedByUserId       String                @map("submitted_by_user_id") @db.Uuid
+  createdAt               DateTime              @default(now()) @map("created_at")
+  updatedAt               DateTime              @updatedAt @map("updated_at")
+
+  customer      Customer?           @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  agent         Agent?              @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  employee      Employee?           @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  submittedBy   User                @relation(fields: [submittedByUserId], references: [id], onDelete: Restrict)
+  statusHistory VisaStatusHistory[]
+
+  @@index([customerId])
+  @@index([agentId])
+  @@index([employeeId])
+  @@map("visa_applications")
+}
+
+model VisaStatusHistory {
+  id            String                 @id @default(uuid()) @db.Uuid
+  applicationId String                 @map("application_id") @db.Uuid
+  fromStatus    VisaApplicationStatus? @map("from_status")
+  toStatus      VisaApplicationStatus  @map("to_status")
+  actorUserId   String?                @map("actor_user_id") @db.Uuid
+  note          String?
+  createdAt     DateTime               @default(now()) @map("created_at")
+
+  application VisaApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+  @@map("visa_status_history")
+}
+
+/**
+ * The Phase 6 "package builder" MVP: a thin wrapper tying exactly one
+ * flight Booking to exactly one HotelBooking under a single reference,
+ * built and priced together at checkout (see PackagesService). Each
+ * underlying booking still goes through its own real adapter/audit/
+ * payment path — this table adds nothing but the shared reference and
+ * combined total, deliberately not a third parallel booking pipeline.
+ */
+model TravelPackage {
+  id               String   @id @default(uuid()) @db.Uuid
+  packageReference String   @unique @map("package_reference")
+  customerId       String?  @map("customer_id") @db.Uuid
+  agentId          String?  @map("agent_id") @db.Uuid
+  employeeId       String?  @map("employee_id") @db.Uuid
+  currency         String
+  totalAmount      Decimal  @map("total_amount") @db.Decimal(12, 2)
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  customer      Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  agent         Agent?        @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  employee      Employee?     @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  flightBooking Booking?
+  hotelBooking  HotelBooking?
+
+  @@index([customerId])
+  @@map("travel_packages")
+}
+
+// ── Hajj & Umrah packages (extends the packages domain above) ───────
+
+enum HajjUmrahPackageType {
+  HAJJ
+  UMRAH
+}
+
+enum DepositType {
+  PERCENTAGE
+  FIXED
+}
+
+enum HajjUmrahBookingStatus {
+  PENDING_DEPOSIT
+  DEPOSIT_PAID
+  PARTIALLY_PAID
+  FULLY_PAID
+  CANCELLED
+}
+
+/**
+ * Hajj & Umrah package catalog. TravelPackage above (Phase 6) only bundles
+ * two already-confirmed bookings and has no concept of a future dated
+ * departure, capacity, or a deposit — it cannot support "browse upcoming
+ * packages" — so this extends the packages domain with a real dated,
+ * capacity-limited, deposit-priced catalog instead of overloading that
+ * model. Admin-managed (see Permission.HAJJ_UMRAH_MANAGE); publicly
+ * browsable with no auth, the same way GET /flights/search and
+ * POST /assistant/chat are (see HajjUmrahController).
+ */
+model HajjUmrahPackage {
+  id             String               @id @default(uuid()) @db.Uuid
+  title          String
+  type           HajjUmrahPackageType
+  description    String?
+  departureDate  DateTime             @map("departure_date")
+  returnDate     DateTime             @map("return_date")
+  durationNights Int                  @map("duration_nights")
+  currency       String
+  /** Price PER PILGRIM in `currency` — a booking's own totalAmount is this × HajjUmrahBooking.pilgrims, captured at booking time so a later price change never reaches an existing booking. */
+  totalAmount    Decimal              @map("total_amount") @db.Decimal(12, 2)
+  /** Admin's choice of how the minimum deposit is computed — see depositValue and HajjUmrahBooking.minimumDepositAmount for the actual formula, documented on HajjUmrahService.calculateMinimumDeposit. */
+  depositType    DepositType          @map("deposit_type")
+  /** A percentage of totalAmount (0-100) when depositType is PERCENTAGE, or a fixed amount per pilgrim in `currency` when depositType is FIXED. */
+  depositValue   Decimal              @map("deposit_value") @db.Decimal(12, 2)
+  capacity       Int
+  /** Denormalized running total of pilgrims already booked across all non-cancelled bookings — kept in sync inside the same $transaction as each booking's creation (see HajjUmrahService.createBooking). No native Postgres array columns are used anywhere in this schema, so this stays a plain Int rather than tracking individual seats. */
+  seatsBooked    Int                  @default(0) @map("seats_booked")
+  /** Free-form list of what's included (flights, hotel category, ziyarat, guide, meals, etc.) — Json for the same reason as AuditLog/FlightOffer's Json columns elsewhere in this schema. */
+  inclusions     Json?
+  makkahHotel    String?              @map("makkah_hotel")
+  madinahHotel   String?              @map("madinah_hotel")
+  active         Boolean              @default(true)
+  createdAt      DateTime             @default(now()) @map("created_at")
+  updatedAt      DateTime             @updatedAt @map("updated_at")
+
+  bookings HajjUmrahBooking[]
+
+  @@index([type, active, departureDate])
+  @@map("hajj_umrah_packages")
+}
+
+/**
+ * A pilgrim's booking against one HajjUmrahPackage departure. Follows the
+ * same reserve-then-charge shape as Booking/HotelBooking: HajjUmrahService
+ * reserves seats and creates this row inside one $transaction, then charges
+ * the initial deposit via PaymentsService.chargeForHajjUmrahBooking OUTSIDE
+ * that transaction — mirroring BookingsService/HotelsService (see
+ * PaymentsService's doc comments). amountPaid/status advance as further
+ * Payment rows against this booking succeed (see Payment.hajjUmrahBookingId),
+ * supporting later installments beyond the initial deposit.
+ */
+model HajjUmrahBooking {
+  id                   String                 @id @default(uuid()) @db.Uuid
+  bookingReference     String                 @unique @map("booking_reference")
+  packageId            String                 @map("package_id") @db.Uuid
+  customerId           String?                @map("customer_id") @db.Uuid
+  agentId              String?                @map("agent_id") @db.Uuid
+  employeeId           String?                @map("employee_id") @db.Uuid
+  pilgrims             Int
+  leadPilgrimName      String                 @map("lead_pilgrim_name")
+  contactPhone         String                 @map("contact_phone")
+  contactEmail         String                 @map("contact_email")
+  currency             String
+  /** pilgrims × the package's per-pilgrim totalAmount at the moment this booking was created — a snapshot, unaffected by later changes to the package's price. */
+  totalAmount          Decimal                @map("total_amount") @db.Decimal(12, 2)
+  /** Computed once at booking time from the package's depositType/depositValue and this booking's pilgrim count — never recomputed afterward even if the package's deposit rule later changes. See HajjUmrahService.calculateMinimumDeposit. */
+  minimumDepositAmount Decimal                @map("minimum_deposit_amount") @db.Decimal(12, 2)
+  amountPaid           Decimal                @default(0) @map("amount_paid") @db.Decimal(12, 2)
+  status               HajjUmrahBookingStatus @default(PENDING_DEPOSIT)
+  /** Same role as Booking.idempotencyKey/HotelBooking.idempotencyKey — a retried create-booking request (e.g. a client double-submit) must reserve seats and charge the deposit at most once. Distinct from the Payment row's own idempotencyKey, which guards each individual charge (deposit or later installment). */
+  idempotencyKey       String?                @unique @map("idempotency_key")
+  createdAt            DateTime               @default(now()) @map("created_at")
+  updatedAt            DateTime               @updatedAt @map("updated_at")
+
+  package  HajjUmrahPackage @relation(fields: [packageId], references: [id], onDelete: Restrict)
+  customer Customer?        @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  agent    Agent?           @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  employee Employee?        @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  payments Payment[]
+
+  @@index([packageId])
+  @@index([customerId])
+  @@map("hajj_umrah_bookings")
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// PHASE 13 — Manpower (overseas job placement / recruitment)
+// ═════════════════════════════════════════════════════════════════════
+
+enum ManpowerApplicationStatus {
+  SUBMITTED
+  UNDER_REVIEW
+  SHORTLISTED
+  INTERVIEW_SCHEDULED
+  SELECTED
+  VISA_PROCESSING
+  DEPLOYED
+  REJECTED
+  WITHDRAWN
+}
+
+/**
+ * Job/manpower-request catalog, following the same "extend the domain
+ * rather than overload an existing model" precedent as HajjUmrahPackage:
+ * admin-managed (Permission.MANPOWER_MANAGE), publicly browsable with no
+ * auth, the same way GET /flights/search and GET /hajj-umrah/packages are.
+ * Deliberately carries NO fee/deposit/payment fields — recruitment fees
+ * charged to job seekers are a well-known abuse vector in this industry,
+ * and this platform does not model or process one; see docs/ROADMAP.md.
+ */
+model ManpowerJob {
+  id                     String   @id @default(uuid()) @db.Uuid
+  title                  String
+  country                String // destination country of employment
+  employer               String? // named on the demand letter, when disclosed
+  category               String? // e.g. Construction, Domestic, Driver, Nursing — free text, not an enum, for the same reason VisaApplication.visaType is free text
+  positionsAvailable     Int      @map("positions_available")
+  /** Denormalized running count of non-withdrawn/non-rejected applications against this job — kept in sync inside the same $transaction as each application's creation, mirroring HajjUmrahPackage.seatsBooked. */
+  positionsFilled        Int      @default(0) @map("positions_filled")
+  salaryMin              Decimal? @map("salary_min") @db.Decimal(12, 2)
+  salaryMax              Decimal? @map("salary_max") @db.Decimal(12, 2)
+  currency               String?
+  contractDurationMonths Int?     @map("contract_duration_months")
+  /** Free-form list of requirements (age range, experience, certificates, language) — Json for the same reason as HajjUmrahPackage.inclusions. */
+  requirements           Json?
+  /** Free-form list of what's provided (accommodation, food, flight, medical insurance) — same Json rationale as above. */
+  benefits               Json?
+  applicationDeadline    DateTime? @map("application_deadline")
+  active                 Boolean  @default(true)
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
+
+  applications ManpowerApplication[]
+
+  @@map("manpower_jobs")
+}
+
+/**
+ * A workflow/document process like VisaApplication, not a paid booking —
+ * candidates apply to a ManpowerJob and staff (MANPOWER_MANAGE) move the
+ * application forward. ManpowerStatusHistory is this table's audit trail,
+ * mirroring VisaStatusHistory's role for VisaApplication.
+ */
+model ManpowerApplication {
+  id                      String                    @id @default(uuid()) @db.Uuid
+  applicationReference    String                    @unique @map("application_reference")
+  jobId                   String                    @map("job_id") @db.Uuid
+  applicantFullName       String                    @map("applicant_full_name")
+  applicantPassportNumber String?                   @map("applicant_passport_number")
+  applicantNationality    String                    @map("applicant_nationality")
+  dateOfBirth             DateTime?                 @map("date_of_birth") @db.Date
+  yearsOfExperience       Int?                      @map("years_of_experience")
+  currentOccupation       String?                   @map("current_occupation")
+  coverNote               String?                   @map("cover_note")
+  contactEmail            String                    @map("contact_email")
+  contactPhone            String                    @map("contact_phone")
+  status                  ManpowerApplicationStatus @default(SUBMITTED)
+  reviewerNote            String?                   @map("reviewer_note")
+  customerId              String?                   @map("customer_id") @db.Uuid
+  agentId                 String?                   @map("agent_id") @db.Uuid
+  employeeId              String?                   @map("employee_id") @db.Uuid
+  submittedByUserId       String                    @map("submitted_by_user_id") @db.Uuid
+  createdAt               DateTime                  @default(now()) @map("created_at")
+  updatedAt               DateTime                  @updatedAt @map("updated_at")
+
+  job           ManpowerJob             @relation(fields: [jobId], references: [id], onDelete: Restrict)
+  customer      Customer?               @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  agent         Agent?                  @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  employee      Employee?               @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  submittedBy   User                    @relation(fields: [submittedByUserId], references: [id], onDelete: Restrict)
+  statusHistory ManpowerStatusHistory[]
+
+  @@index([jobId])
+  @@index([customerId])
+  @@index([agentId])
+  @@index([employeeId])
+  @@map("manpower_applications")
+}
+
+model ManpowerStatusHistory {
+  id            String                     @id @default(uuid()) @db.Uuid
+  applicationId String                     @map("application_id") @db.Uuid
+  fromStatus    ManpowerApplicationStatus? @map("from_status")
+  toStatus      ManpowerApplicationStatus  @map("to_status")
+  actorUserId   String?                    @map("actor_user_id") @db.Uuid
+  note          String?
+  createdAt     DateTime                   @default(now()) @map("created_at")
+
+  application ManpowerApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+  @@map("manpower_status_history")
+}

@@ -1,0 +1,19 @@
+# Minimal Alertmanager config — routes every alert to a single receiver
+# that logs/no-ops by default. Replace `webhook_configs`/add
+# `slack_configs`/`email_configs`/`pagerduty_configs` with your team's
+# real on-call channel before relying on this in staging or production;
+# shipped as a structurally valid, safe-to-run-with-no-credentials
+# default, not a configured paging integration.
+route:
+  receiver: default
+  group_by: ['alertname']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: default
+    # No real endpoint configured — alerts fire and are visible in the
+    # Alertmanager UI (http://localhost:9093) but nothing is paged until
+    # a receiver below is filled in.
+    webhook_configs: []
